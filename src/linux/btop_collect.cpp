@@ -308,11 +308,19 @@ namespace Gpu {
 			std::filesystem::path hwmon;
 			std::filesystem::path power;            //? empty if no power sensor
 			std::filesystem::path frequency;        //? empty if no current clock source
+			std::filesystem::path agx_stats;        //? Apple AGX firmware statistics; empty if absent
+			vector<std::filesystem::path> temps;    //? temperature inputs (millidegrees); the maximum is reported
 			device_vendor vendor;
 			uint32_t pci_device_id;
-			bool has_temp;
 			bool has_busy;
 			bool has_vram;
+			bool agx_has_util;
+			bool agx_has_clock;
+			bool agx_has_power;
+			//? Last valid agx_stats samples. The firmware statistics briefly read "stale" while
+			//? being updated; the previous value is held instead of dropping to zero.
+			long long agx_util;
+			unsigned int agx_clock_mhz;
 		};
 
 		bool initialized = false;
@@ -2071,6 +2079,79 @@ namespace Gpu {
 			return {};
 		}
 
+		//? One reading of <device>/agx_stats ("key value" lines) as exposed by the asahi/aurora DRM drivers.
+		//? Values read "unsupported" when the firmware does not provide them, or while the matching
+		//? *_status line is not "valid".
+		struct agx_stats_sample {
+			bool has_util = false;
+			bool has_clock = false;
+			bool util_valid = false;
+			bool pstate_valid = false;
+			std::optional<long long> util;
+			std::optional<long long> frequency_hz;
+			std::optional<long long> power_mw;
+		};
+
+		static std::optional<long long> parse_agx_number(std::string_view value) {
+			long long out{};
+			const auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), out);
+			if (ec != std::errc{} or ptr != value.data() + value.size()) return std::nullopt;
+			return out;
+		}
+
+		static agx_stats_sample read_agx_stats(const std::filesystem::path& path) {
+			agx_stats_sample sample;
+			std::ifstream file(path);
+			for (string line; std::getline(file, line);) {
+				const std::string_view entry(line);
+				const auto sep = entry.find(' ');
+				if (sep == std::string_view::npos) continue;
+				const auto key = entry.substr(0, sep);
+				const auto value = entry.substr(sep + 1);
+				if (key == "utilisation_status") sample.util_valid = value == "valid";
+				else if (key == "pstate_status") sample.pstate_valid = value == "valid";
+				else if (key == "util_device_percent") {
+					sample.has_util = true;
+					sample.util = parse_agx_number(value);
+				}
+				else if (key == "achieved_frequency_hz") {
+					sample.has_clock = true;
+					sample.frequency_hz = parse_agx_number(value);
+				}
+				else if (key == "power_mw") sample.power_mw = parse_agx_number(value);
+			}
+			return sample;
+		}
+
+		//? Apple SoCs report GPU die temperatures through the SMC hwmon device (macsmc_hwmon),
+		//? not below the DRM device. Collect every channel labelled "GPU Die ...".
+		static vector<std::filesystem::path> find_apple_gpu_temps() {
+			vector<std::filesystem::path> temps;
+			std::error_code ec;
+			for (const auto& hwmon : std::filesystem::directory_iterator("/sys/class/hwmon", ec)) {
+				std::error_code entry_ec;
+				for (const auto& entry : std::filesystem::directory_iterator(hwmon.path(), entry_ec)) {
+					const string fname = entry.path().filename().string();
+					if (not fname.starts_with("temp") or not fname.ends_with("_label")) continue;
+					if (not readfile(entry.path()).starts_with("GPU Die")) continue;
+					auto input = hwmon.path() / (fname.substr(0, fname.size() - 6) + "_input");
+					if (std::filesystem::exists(input)) temps.push_back(std::move(input));
+				}
+			}
+			return temps;
+		}
+
+		//? "apple,agx-g17c" (first devicetree compatible) -> "Apple AGX G17C".
+		static string apple_gpu_name(const std::filesystem::path& device) {
+			const string compatible = readfile(device / "of_node" / "compatible");
+			const std::string_view first(compatible.c_str());
+			constexpr std::string_view prefix = "apple,agx-";
+			if (not first.starts_with(prefix) or first.size() == prefix.size()) return "Apple AGX GPU";
+			string generation(first.substr(prefix.size()));
+			std::ranges::transform(generation, generation.begin(), [](unsigned char c) { return (char)std::toupper(c); });
+			return "Apple AGX " + generation;
+		}
+
 		bool init(bool use_amd, bool use_apple) {
 			if (initialized) return false;
 			if (not use_amd and not use_apple) return false;
@@ -2099,7 +2180,7 @@ namespace Gpu {
 
 				const bool is_amd = use_amd and Rsmi::device_count == 0
 					and vendor == "0x1002" and driver == "amdgpu";
-				const bool is_apple = use_apple and (driver == "asahi" or driver == "apple-gpu");
+				const bool is_apple = use_apple and (driver == "asahi" or driver == "aurora" or driver == "apple-gpu");
 				if (not is_amd and not is_apple) continue;
 
 				device_paths d{};
@@ -2119,7 +2200,7 @@ namespace Gpu {
 				d.has_vram = std::filesystem::exists(device_link / "mem_info_vram_total");
 
 				if (not d.hwmon.empty()) {
-					d.has_temp = std::filesystem::exists(d.hwmon / "temp1_input");
+					if (std::filesystem::exists(d.hwmon / "temp1_input")) d.temps.push_back(d.hwmon / "temp1_input");
 					const auto hwmon_frequency = d.hwmon / "freq1_input";
 					if (std::filesystem::exists(hwmon_frequency)) d.frequency = hwmon_frequency;
 					//? Prefer power1_average (filtered, EMA) over power1_input (instantaneous).
@@ -2130,10 +2211,23 @@ namespace Gpu {
 				}
 				if (d.frequency.empty()) d.frequency = find_devfreq_frequency(device_link);
 
+				if (is_apple) {
+					if (std::filesystem::exists(device_link / "agx_stats")) {
+						d.agx_stats = device_link / "agx_stats";
+						const auto sample = read_agx_stats(d.agx_stats);
+						d.agx_has_util = sample.has_util and not d.has_busy;
+						//? The status-gated fields can read "unsupported" transiently, so key presence decides support.
+						d.agx_has_clock = sample.has_clock and d.frequency.empty();
+						d.agx_has_power = sample.power_mw.has_value() and d.power.empty();
+					}
+					if (d.temps.empty()) d.temps = find_apple_gpu_temps();
+				}
+
 				//? Skip cards with no readable signals — virtual GPUs, fresh-bound devices,
 				//? or driver states where nothing useful is exposed yet. Otherwise btop would
 				//? render an empty GPU entry every tick.
-				if (not (d.has_busy or d.has_vram or d.has_temp or not d.frequency.empty() or not d.power.empty())) {
+				if (not (d.has_busy or d.has_vram or not d.temps.empty() or not d.frequency.empty() or not d.power.empty()
+						or d.agx_has_util or d.agx_has_clock or d.agx_has_power)) {
 					Logger::debug("GPU sysfs: skipping {} — no readable metrics", device_link.string());
 					continue;
 				}
@@ -2151,7 +2245,7 @@ namespace Gpu {
 			gpu_names.resize(Nvml::device_count + Rsmi::device_count + device_count);
 			for (uint32_t i = 0; i < device_count; ++i) {
 				gpu_names[Nvml::device_count + Rsmi::device_count + i] = devices[i].vendor == device_vendor::apple
-					? "Apple AGX Graphics"
+					? apple_gpu_name(devices[i].device)
 					: fmt::format("AMD GPU (1002:{:04x})", devices[i].pci_device_id);
 			}
 
@@ -2174,17 +2268,17 @@ namespace Gpu {
 
 			for (uint32_t i = 0; i < device_count; ++i) {
 				gpu_info& gpu = gpus_slice[i];
-				const device_paths& d = devices[i];
+				device_paths& d = devices[i];
 
 				if constexpr (is_init) {
 					gpu.supported_functions = {
-						.gpu_utilization = d.has_busy,
+						.gpu_utilization = d.has_busy or d.agx_has_util,
 						.mem_utilization = false,
-						.gpu_clock = not d.frequency.empty(),
+						.gpu_clock = not d.frequency.empty() or d.agx_has_clock,
 						.mem_clock = false, //? only DPM table is exposed via pp_dpm_mclk, not the current frequency
-						.pwr_usage = not d.power.empty(),
+						.pwr_usage = not d.power.empty() or d.agx_has_power,
 						.pwr_state = false,
-						.temp_info = d.has_temp,
+						.temp_info = not d.temps.empty(),
 						.mem_total = d.has_vram,
 						.mem_used = d.has_vram,
 						.pcie_txrx = false,
@@ -2195,17 +2289,34 @@ namespace Gpu {
 					gpu.pwr_max_usage = 0;
 				}
 
+				std::optional<long long> power_mw;
+				if (not d.agx_stats.empty()) {
+					const auto sample = read_agx_stats(d.agx_stats);
+					//? Only take values from a sample whose utilisation window is valid; while the firmware
+					//? statistics are stale the clock can read a leftover value, so hold the previous ones.
+					if (sample.util_valid and sample.util) d.agx_util = std::clamp(*sample.util, 0LL, 100LL);
+					if (sample.util_valid and sample.pstate_valid and sample.frequency_hz)
+						d.agx_clock_mhz = (unsigned int)(std::max(*sample.frequency_hz, 0LL) / 1'000'000); //? Hz → MHz
+					if (d.agx_has_power and sample.power_mw) power_mw = std::max(*sample.power_mw, 0LL);
+				}
+
 				if (d.has_busy) {
 					gpu.gpu_percent.at("gpu-totals").push_back(
 						std::clamp(read_ll(d.device / "gpu_busy_percent"), 0LL, 100LL));
 				}
-
-				if (d.has_temp) {
-					gpu.temp.push_back(read_ll(d.hwmon / "temp1_input") / 1000); //? millidegrees → degrees
+				else if (d.agx_has_util) {
+					gpu.gpu_percent.at("gpu-totals").push_back(d.agx_util);
 				}
 
-				if (not d.power.empty()) {
-					gpu.pwr_usage = read_ll(d.power) / 1000; //? microwatts → milliwatts
+				if (not d.temps.empty()) {
+					long long temp_max = 0;
+					for (const auto& temp : d.temps) temp_max = std::max(temp_max, read_ll(temp));
+					gpu.temp.push_back(temp_max / 1000); //? millidegrees → degrees
+				}
+
+				if (not d.power.empty()) power_mw = read_ll(d.power) / 1000; //? microwatts → milliwatts
+				if (power_mw) {
+					gpu.pwr_usage = *power_mw;
 					gpu.pwr_max_usage = std::max(gpu.pwr_max_usage, gpu.pwr_usage);
 					if (gpu.pwr_max_usage > 0) {
 						gpu.gpu_percent.at("gpu-pwr-totals").push_back(
@@ -2215,6 +2326,9 @@ namespace Gpu {
 
 				if (not d.frequency.empty()) {
 					gpu.gpu_clock_speed = (unsigned int)(read_ll(d.frequency) / 1'000'000); //? Hz → MHz
+				}
+				else if (d.agx_has_clock) {
+					gpu.gpu_clock_speed = d.agx_clock_mhz;
 				}
 
 				if (d.has_vram) {

@@ -320,6 +320,12 @@ See [GPU compatibility](#gpu-compatibility) section for more about compiling wit
 
    Can be set with `make setcap` (preferred) or `make setuid` or by running btop with `sudo` or equivalent.
 
+ * **APPLE SILICON (LINUX)**
+
+   Apple GPUs driven by the `asahi` (or compatible `aurora`) DRM driver are read from sysfs, no extra libraries needed.
+   Utilisation and clock come from the driver's `agx_stats` node, temperature from the SMC hwmon "GPU Die" sensors.
+   GPU memory is unified with system memory and is not shown. Enable with `apple` in the `shown_gpus` option (default).
+
 ### **Notice (Text rendering issues)**
 
 * If you are having problems with the characters in the graphs not looking like they do in the screenshots, it's likely a problem with your systems configured fallback font not having support for braille characters.
